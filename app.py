@@ -22,7 +22,7 @@ from typing import Dict, Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
+from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, spectral, storage
 
 try:
     from flask_cors import CORS
@@ -389,6 +389,72 @@ def api_edit(file_id: str):
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
     _apply_edit(_abs_path(entry), dst, op, data.get("params", {}))
     new_entry = _register_derived(entry["id"], name, dst, {"op": op})
+    return jsonify(new_entry)
+
+
+# --------------------------------------------------------------------------- #
+# Spectral repair (time-frequency region eraser)
+# --------------------------------------------------------------------------- #
+
+def _repair_params(data: Dict) -> Dict:
+    """Extract shared spectral-repair parameters from a request body."""
+    def _opt_int(key):
+        v = data.get(key)
+        return int(v) if v not in (None, "", 0) else None
+    return {
+        "feather_t": float(data.get("feather_t", 0.01)),
+        "feather_f": float(data.get("feather_f", 40.0)),
+        "nfft": _opt_int("nfft"),
+        "hop": _opt_int("hop"),
+        "reduction_db": (float(data["reduction_db"])
+                         if data.get("reduction_db") is not None else None),
+    }
+
+
+@app.post("/api/audio/<file_id>/spectral-repair/preview")
+def api_spectral_repair_preview(file_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    data = request.get_json(force=True) or {}
+    regions = data.get("regions", [])
+    if not regions:
+        return jsonify(error="no regions provided"), 400
+    duration = float(entry["duration"])
+    start = float(data.get("start", 0.0))
+    length = float(data.get("duration", min(6.0, max(0.1, duration - start))))
+    # Centre the preview window on the first rectangle when not given.
+    if data.get("start") is None:
+        r0 = regions[0]
+        centre = (float(r0.get("start", 0)) + float(r0.get("end", 0))) * 0.5
+        start = max(0.0, centre - length * 0.5)
+    wav = spectral.render_preview_wav(
+        _abs_path(entry), regions, start, length, **_repair_params(data))
+    return jsonify({"wav": base64.b64encode(wav).decode(),
+                    "size": len(wav), "start": start, "duration": length})
+
+
+@app.post("/api/audio/<file_id>/spectral-repair")
+def api_spectral_repair(file_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    data = request.get_json(force=True) or {}
+    regions = data.get("regions", [])
+    if not regions:
+        return jsonify(error="no regions provided"), 400
+
+    file_id_new = storage.new_id()
+    dst = os.path.join(store.audio_dir, file_id_new + ".wav")
+    info = spectral.repair_file(
+        _abs_path(entry), dst, regions, **_repair_params(data))
+    name = data.get("name") or f"spectral-repair-{entry['name']}"
+    new_entry = _register_derived(entry["id"], name, dst, {
+        "op": "spectral_repair",
+        "regions": regions,
+        "feather_t": info.get("feather_t"),
+        **info,
+    })
     return jsonify(new_entry)
 
 

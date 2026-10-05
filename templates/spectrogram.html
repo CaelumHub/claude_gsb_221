@@ -4,7 +4,7 @@
 <div class="main-head">
   <div>
     <h1>频谱图与声谱分析</h1>
-    <div class="sub">STFT 短时傅里叶变换 · dB 声谱图 · 频谱质心/滚降/平坦度/通量/能量</div>
+    <div class="sub">STFT 短时傅里叶变换 · dB 声谱图 · 频谱特征 · 频谱修复（框选时间-频率区域，衰减/擦除噪声、啸叫、杂音）</div>
   </div>
   <div class="row">
     <select id="fileSel" style="min-width:220px"></select>
@@ -17,12 +17,39 @@
     <h2 style="margin:0">声谱图</h2>
     <span id="specInfo" class="muted small"></span>
   </div>
-  <div class="plot"><canvas id="spec" style="height:300px"></canvas></div>
-  <div class="row mt small muted">
-    <span>频率 0 – 20 kHz（向上）</span>
-    <span class="spacer"></span>
-    <span>时间 →</span>
+  <div class="plot" style="position:relative"><canvas id="spec" style="height:300px;cursor:crosshair"></canvas></div>
+  <div class="row mt small muted between">
+    <span>频率 0 – Nyquist（向上）</span>
+    <span id="cursorInfo" class="mono"></span>
+    <span>时间 →（在图上拖拽框选修复区域，可连续框选多个）</span>
   </div>
+</div>
+
+<div class="card">
+  <h2>频谱修复</h2>
+  <div class="row" style="flex-wrap:wrap;gap:14px;align-items:flex-end">
+    <label class="field inline">
+      衰减强度
+      <input type="range" id="strength" min="0" max="96" step="1" value="24" style="width:180px" />
+      <span id="strengthVal" class="mono" style="min-width:92px">24 dB</span>
+    </label>
+    <label class="field inline"><input type="checkbox" id="eraseChk" /> 完全擦除（静音该区域）</label>
+    <label class="field inline">时间羽化(ms)
+      <input type="number" id="featherT" value="10" min="0" max="500" step="1" style="width:70px" />
+    </label>
+    <label class="field inline">频率羽化(Hz)
+      <input type="number" id="featherF" value="40" min="0" max="4000" step="5" style="width:70px" />
+    </label>
+    <button id="previewBtn">▶ 试听修复片段</button>
+    <button id="stopBtn">■ 停止</button>
+    <button class="btn-primary" id="applyBtn">应用修复（生成新文件）</button>
+    <button id="clearBtn">清除框选</button>
+    <button id="playOrigBtn">播放原音频</button>
+  </div>
+  <div class="mt small muted">
+    羽化让选区边界平滑过渡，避免爆音与振铃；框选极小区域或横跨整个频段均可正确生效。修复仅作用于框选区域，其它部分原样保留，时长与采样率不变。
+  </div>
+  <div class="mt" id="regionList" style="display:flex;flex-direction:column;gap:6px"></div>
 </div>
 
 <div class="card">
@@ -40,18 +67,31 @@
   <div class="plot"><canvas id="features" style="height:220px"></canvas></div>
   <div class="legend mt" id="featureLegend"></div>
 </div>
+
+<div class="card hidden" id="resultCard">
+  <h2>修复结果</h2>
+  <div class="row" id="resultRow"></div>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-let spectral = null;
+let spectral = null, spec = null, fileMap = {};
+let currentId = null;
+let regions = [];          // {t0,t1,f0,f1,reduction_db,erase}
+let baseImage = null;      // cached spectrogram pixels (overlay re-blit)
+const previewAudio = new Audio();
+const specCanvas = $("#spec");
 
 async function loadFiles(selected) {
   const files = await API.get("/api/library");
+  fileMap = {};
   const sel = $("#fileSel");
-  sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  sel.innerHTML = files.map(f => { fileMap[f.id] = f; return `<option value="${f.id}">${esc(f.name)}</option>`; }).join("");
   if (selected) sel.value = selected;
 }
+
+function entry() { return fileMap[$("#fileSel").value] || {}; }
 
 function drawFeatures() {
   if (!spectral) return;
@@ -77,30 +117,245 @@ function drawFeatures() {
   drawLinePlot($("#features"), series);
 }
 
+/* ------------------------------------------- spectrogram + region overlay */
+
+function specGeometry() {
+  const canvas = $("#spec");
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.max(1, Math.floor(rect.width));
+  const h = Math.max(1, Math.floor(rect.height));
+  const e = entry();
+  const dur = (spec && spec.times && spec.times.length)
+    ? Math.max(e.duration || 0, spec.times[spec.times.length - 1])
+    : (e.duration || 1);
+  const nyq = (spec && spec.sr) ? spec.sr / 2 : (e.sr || 44100) / 2;
+  return { canvas, w, h, dur, nyq };
+}
+
+function pxToTF(x, y) {
+  const g = specGeometry();
+  const t = Math.max(0, Math.min(g.dur, x / g.w * g.dur));
+  const f = Math.max(0, Math.min(g.nyq, (1 - y / g.h) * g.nyq));
+  return { t, f };
+}
+
+function tfToPx(t, f) {
+  const g = specGeometry();
+  return { x: t / g.dur * g.w, y: (1 - f / g.nyq) * g.h };
+}
+
+function drawBaseSpectrogram() {
+  if (!spec) return;
+  const canvas = $("#spec");
+  drawSpectrogram(canvas, spec);
+  baseImage = null;  // force overlay to re-blit on next frame
+  drawOverlay();
+}
+
+function drawOverlay() {
+  if (!spec) return;
+  const canvas = $("#spec");
+  const { ctx, w, h } = setupCanvas(canvas);
+  // Re-blit the cached spectrogram pixels, then paint selection overlays.
+  if (!baseImage) {
+    baseImage = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  } else {
+    ctx.putImageData(baseImage, 0, 0);
+  }
+  ctx.save();
+  ctx.lineWidth = 1.5;
+  regions.forEach((r, i) => {
+    const a = tfToPx(r.t0, r.f1), b = tfToPx(r.t1, r.f0);
+    const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+    const rw = Math.max(2, Math.abs(b.x - a.x)), rh = Math.max(2, Math.abs(b.y - a.y));
+    ctx.fillStyle = "rgba(248,81,73,0.18)";
+    ctx.strokeStyle = "#f85149";
+    ctx.fillRect(x, y, rw, rh);
+    ctx.strokeRect(x, y, rw, rh);
+    ctx.fillStyle = "#f85149";
+    ctx.font = "bold 10px sans-serif";
+    ctx.fillText(String(i + 1), x + 3, y + 11);
+  });
+  if (dragging && dragStart && dragCur) {
+    const x = Math.min(dragStart.x, dragCur.x), y = Math.min(dragStart.y, dragCur.y);
+    const rw = Math.abs(dragCur.x - dragStart.x), rh = Math.abs(dragCur.y - dragStart.y);
+    ctx.fillStyle = "rgba(88,166,255,0.18)";
+    ctx.strokeStyle = "#58a6ff";
+    ctx.fillRect(x, y, rw, rh);
+    ctx.strokeRect(x, y, rw, rh);
+  }
+  ctx.restore();
+}
+
+function renderRegionList() {
+  const box = $("#regionList");
+  if (!regions.length) { box.innerHTML = '<span class="muted small">尚未框选修复区域</span>'; return; }
+  box.innerHTML = regions.map((r, i) => `
+    <div class="row small" style="gap:10px;align-items:center;background:var(--card-alt,rgba(255,255,255,0.03));padding:6px 10px;border-radius:6px">
+      <span style="color:#f85149;font-weight:bold">#${i + 1}</span>
+      <span class="mono">${fmtTime(r.t0)} – ${fmtTime(r.t1)}</span>
+      <span class="mono muted">${fmtHz(r.f0)} – ${fmtHz(r.f1)}</span>
+      <span class="muted">${r.erase ? "完全擦除" : "衰减 " + r.reduction_db + " dB"}</span>
+      <span class="spacer"></span>
+      <button data-del="${i}" style="padding:2px 10px">删除</button>
+    </div>`).join("");
+  box.querySelectorAll("[data-del]").forEach(b => b.onclick = () => {
+    regions.splice(+b.dataset.del, 1);
+    renderRegionList();
+    drawOverlay();
+  });
+}
+
+/* --------------------------------------------------------------- run load */
+
 async function run() {
   const id = $("#fileSel").value;
   if (!id) return;
+  currentId = id;
+  regions = [];
+  renderRegionList();
+  $("#resultCard").classList.add("hidden");
   const btn = $("#loadBtn");
   btn.disabled = true; btn.textContent = "分析中…";
   try {
-    const spec = (await API.get(`/api/analyze/${id}/spectrogram`)).data;
+    spec = (await API.get(`/api/analyze/${id}/spectrogram`)).data;
     spectral = (await API.get(`/api/analyze/${id}/spectral`)).data;
-    drawSpectrogram($("#spec"), spec);
+    drawBaseSpectrogram();
     $("#specInfo").textContent =
-      `${spec.times.length} 时间帧 × ${spec.freqs.length} 频带 · nfft=${spec.nfft} · hop=${spec.hop}`;
+      `${spec.times.length} 时间帧 × ${spec.freqs.length} 频带 · nfft=${spec.nfft} · hop=${spec.hop} · ${entry().sr} Hz`;
     drawFeatures();
   } catch (e) { toast(e.message, "error"); }
   finally { btn.disabled = false; btn.textContent = "分析"; }
 }
 
+/* --------------------------------------------------------- mouse selection */
+
+let dragStart = null, dragCur = null, dragging = false;
+
+specCanvas.addEventListener("mousedown", e => {
+  const r = specCanvas.getBoundingClientRect();
+  dragging = true;
+  dragStart = dragCur = { x: e.clientX - r.left, y: e.clientY - r.top };
+});
+window.addEventListener("mousemove", e => {
+  const r = specCanvas.getBoundingClientRect();
+  if (dragging) {
+    dragCur = {
+      x: Math.max(0, Math.min(r.width, e.clientX - r.left)),
+      y: Math.max(0, Math.min(r.height, e.clientY - r.top)),
+    };
+    drawOverlay();
+  }
+  if (e.target === specCanvas) {
+    const tf = pxToTF(e.clientX - r.left, e.clientY - r.top);
+    $("#cursorInfo").textContent = `t=${tf.t.toFixed(2)}s  f=${fmtHz(tf.f)}`;
+  }
+});
+window.addEventListener("mouseup", () => {
+  if (!dragging) return;
+  dragging = false;
+  const dx = Math.abs(dragCur.x - dragStart.x);
+  const dy = Math.abs(dragCur.y - dragStart.y);
+  if (dx >= 4 && dy >= 4) {
+    const tl = pxToTF(Math.min(dragStart.x, dragCur.x), Math.max(dragStart.y, dragCur.y));
+    const br = pxToTF(Math.max(dragStart.x, dragCur.x), Math.min(dragStart.y, dragCur.y));
+    regions.push({
+      t0: tl.t, t1: br.t, f0: tl.f, f1: br.f,
+      reduction_db: +$("#strength").value,
+      erase: $("#eraseChk").checked,
+    });
+    renderRegionList();
+  }
+  dragStart = dragCur = null;
+  drawOverlay();
+});
+
+/* ---------------------------------------------------------- controls logic */
+
+$("#strength").addEventListener("input", e => {
+  $("#strengthVal").textContent = e.target.value + " dB";
+});
+
+function buildRegions() {
+  const db = +$("#strength").value;
+  const erase = $("#eraseChk").checked;
+  // Regions store the strength chosen when they were drawn.
+  return regions.map(r => ({
+    start: r.t0, end: r.t1, f_low: r.f0, f_high: r.f1,
+    ...(r.erase ? { erase: true } : { reduction_db: r.reduction_db }),
+  }));
+}
+
+function currentParams() {
+  return {
+    regions: buildRegions(),
+    feather_t: (+$("#featherT").value || 0) / 1000.0,
+    feather_f: +$("#featherF").value || 0,
+  };
+}
+
+$("#clearBtn").onclick = () => { regions = []; renderRegionList(); drawOverlay(); };
+
+$("#stopBtn").onclick = () => { previewAudio.pause(); };
+
+$("#playOrigBtn").onclick = () => playFile(currentId, entry().name);
+
+$("#previewBtn").onclick = async () => {
+  if (!regions.length) return toast("请先在声谱图上拖拽框选至少一个区域", "warn");
+  let t0 = Math.min(...regions.map(r => r.t0)), t1 = Math.max(...regions.map(r => r.t1));
+  let start = Math.max(0, t0 - 0.4);
+  let duration = Math.min(8.0, Math.max(0.5, (t1 - t0) + 0.8));
+  if (duration > 8.0 || start + duration > entry().duration) {
+    duration = Math.min(6.0, entry().duration);
+    start = Math.max(0, Math.min(t0, entry().duration - duration));
+  }
+  const btn = $("#previewBtn");
+  btn.disabled = true; btn.textContent = "渲染中…";
+  try {
+    const res = await API.post(`/api/audio/${currentId}/spectral-repair/preview`,
+      { ...currentParams(), start, duration });
+    previewAudio.src = "data:audio/wav;base64," + res.wav;
+    await previewAudio.play();
+    toast("试听修复片段（对比可用“播放原音频”）");
+  } catch (e) { toast(e.message, "error"); }
+  finally { btn.disabled = false; btn.textContent = "▶ 试听修复片段"; }
+};
+
+$("#applyBtn").onclick = async () => {
+  if (!regions.length) return toast("请先在声谱图上拖拽框选至少一个区域", "warn");
+  const btn = $("#applyBtn");
+  btn.disabled = true; btn.textContent = "修复中…";
+  try {
+    const newEntry = await API.post(`/api/audio/${currentId}/spectral-repair`, {
+      ...currentParams(),
+      name: "repair-" + (entry().name || "audio.wav"),
+    });
+    toast("频谱修复完成，已生成新文件", "success");
+    regions = [];
+    renderRegionList();
+    $("#resultCard").classList.remove("hidden");
+    $("#resultRow").innerHTML = `
+      <button class="btn-green" id="openResultBtn">▶ 打开修复后的文件</button>
+      <span class="muted">${esc(newEntry.name)} · ${fmtTime(newEntry.duration)} · ${newEntry.sr} Hz · ${newEntry.channels} 声道</span>`;
+    $("#openResultBtn").onclick = async () => {
+      await loadFiles(newEntry.id);
+      await run();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    };
+  } catch (e) { toast(e.message, "error"); }
+  finally { btn.disabled = false; btn.textContent = "应用修复（生成新文件）"; }
+};
+
 $$("#features, #fCentroid, #fRolloff, #fFlat, #fFlux, #fRms, #fZcr").forEach(el => {
   if (el.type === "checkbox") el.addEventListener("change", drawFeatures);
 });
 $("#loadBtn").onclick = run;
+window.addEventListener("resize", () => { if (spec) drawBaseSpectrogram(); });
 
 (async () => {
   await loadFiles(new URLSearchParams(location.search).get("file"));
   await run();
+  renderRegionList();
 })();
 </script>
 {% endblock %}
