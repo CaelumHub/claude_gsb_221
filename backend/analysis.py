@@ -127,6 +127,7 @@ def analyze_spectrogram(path: str, nfft: int = 2048, hop: int = 512,
         "nfft": nfft,
         "hop": hop,
         "window": win,
+        "duration": total_frames / sr if sr else 0.0,
     }
 
 

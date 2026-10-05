@@ -4,7 +4,7 @@
 <div class="main-head">
   <div>
     <h1>频谱图与声谱分析</h1>
-    <div class="sub">STFT 短时傅里叶变换 · dB 声谱图 · 频谱质心/滚降/平坦度/通量/能量</div>
+    <div class="sub">STFT 短时傅里叶变换 · dB 声谱图 · 频谱修复（框选时间-频率区域衰减/擦除）</div>
   </div>
   <div class="row">
     <select id="fileSel" style="min-width:220px"></select>
@@ -17,12 +17,35 @@
     <h2 style="margin:0">声谱图</h2>
     <span id="specInfo" class="muted small"></span>
   </div>
-  <div class="plot"><canvas id="spec" style="height:300px"></canvas></div>
+  <div class="plot"><canvas id="spec" style="height:300px;cursor:crosshair"></canvas></div>
   <div class="row mt small muted">
-    <span>频率 0 – 20 kHz（向上）</span>
+    <span id="freqAxisLabel">频率（向上）</span>
     <span class="spacer"></span>
+    <span id="dragLabel">在声谱图上拖拽可框选修复区域</span>
     <span>时间 →</span>
   </div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">频谱修复</h2>
+    <button class="btn-sm btn-danger" id="clearRegions">清空区域</button>
+  </div>
+  <div class="row">
+    <label class="field inline">衰减强度
+      <input type="range" id="gainDb" min="-60" max="0" step="1" value="-24" style="width:160px"/>
+      <b class="mono" id="gainDbVal">-24 dB</b>
+    </label>
+    <label class="field inline"><input type="checkbox" id="eraseChk"/> 完全擦除</label>
+    <button class="btn-primary" id="previewBtn">▶ 预览修复</button>
+    <button class="btn-green" id="applyBtn">应用修复（生成新文件）</button>
+  </div>
+  <div id="regionList" class="mt small"></div>
+  <div class="mt small muted">
+    在声谱图上拖拽框选需要处理的时间-频率区域（如某段噪声、啸叫、杂音所在频段），可连续框选多个区域；
+    处理后其它区域不受影响，文件时长保持不变。
+  </div>
+  <div class="row mt hidden" id="repairResult"></div>
 </div>
 
 <div class="card">
@@ -45,6 +68,13 @@
 {% block scripts %}
 <script>
 let spectral = null;
+let spec = null;            // spectrogram analysis
+let specDuration = 0;       // seconds
+let fMax = 22050;           // top of the frequency axis (Hz)
+let specCanvas = null;      // offscreen-rendered spectrogram (for fast redraws)
+let regions = [];           // [{t0,t1,f0,f1}] in seconds / Hz
+let drag = null;            // in-progress drag, canvas fractions {x0,y0,x1,y1}
+let dragging = false;
 
 async function loadFiles(selected) {
   const files = await API.get("/api/library");
@@ -52,6 +82,185 @@ async function loadFiles(selected) {
   sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
   if (selected) sel.value = selected;
 }
+
+/* ------------------------------------------------------------ spectrogram */
+
+/* Paint the dB spectrogram into an arbitrary canvas with explicit size. */
+function paintSpectrogram(canvas, W, H) {
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  const data = (spec && spec.data) || [];
+  const frames = data.length;
+  if (!frames) return;
+  const bands = data[0].length;
+  const img = ctx.createImageData(W, H);
+  for (let y = 0; y < H; y++) {
+    const bandIdx = Math.min(bands - 1, Math.floor((H - 1 - y) / H * bands));
+    for (let x = 0; x < W; x++) {
+      const frameIdx = Math.min(frames - 1, Math.floor(x / W * frames));
+      const t = (data[frameIdx][bandIdx] + 100) / 100;
+      const [r, g, b] = colormap(t);
+      const idx = (y * W + x) * 4;
+      img.data[idx] = r; img.data[idx + 1] = g; img.data[idx + 2] = b; img.data[idx + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+function renderSpec() {
+  const c = $("#spec");
+  const { w, h } = setupCanvas(c);   // also sizes the visible canvas
+  const dpr = window.devicePixelRatio || 1;
+  const off = document.createElement("canvas");
+  paintSpectrogram(off, Math.max(1, Math.floor(w * dpr)), Math.max(1, Math.floor(h * dpr)));
+  specCanvas = off;
+  draw();
+}
+
+function drawRegion(ctx, w, h, t0, t1, f0, f1, inProgress) {
+  const x0 = t0 / specDuration * w, x1 = t1 / specDuration * w;
+  const y0 = (1 - f1 / fMax) * h, y1 = (1 - f0 / fMax) * h;
+  ctx.fillStyle = inProgress ? "rgba(88,166,255,0.22)" : "rgba(248,81,73,0.22)";
+  ctx.strokeStyle = inProgress ? "rgba(88,166,255,0.95)" : "rgba(248,81,73,0.95)";
+  ctx.lineWidth = 1.2;
+  ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+  ctx.strokeRect(x0 + 0.5, y0 + 0.5, x1 - x0 - 1, y1 - y0 - 1);
+}
+
+function draw() {
+  const c = $("#spec");
+  const { ctx, w, h } = setupCanvas(c);
+  if (specCanvas) ctx.drawImage(specCanvas, 0, 0, w, h);
+  if (specDuration > 0) {
+    for (const r of regions) drawRegion(ctx, w, h, r.t0, r.t1, r.f0, r.f1, false);
+    if (drag) {
+      const t0 = Math.min(drag.x0, drag.x1) * specDuration, t1 = Math.max(drag.x0, drag.x1) * specDuration;
+      const f1 = (1 - Math.min(drag.y0, drag.y1)) * fMax, f0 = (1 - Math.max(drag.y0, drag.y1)) * fMax;
+      drawRegion(ctx, w, h, t0, t1, f0, f1, true);
+    }
+  }
+}
+
+/* ------------------------------------------------------------- box select */
+
+const specEl = $("#spec");
+
+function canvasFrac(e) {
+  const r = specEl.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
+    y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)),
+  };
+}
+
+specEl.addEventListener("mousedown", e => {
+  if (!spec || specDuration <= 0) return;
+  const p = canvasFrac(e);
+  dragging = true;
+  drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+  draw();
+});
+window.addEventListener("mousemove", e => {
+  if (!dragging || !drag) return;
+  const p = canvasFrac(e);
+  drag.x1 = p.x; drag.y1 = p.y;
+  const t0 = Math.min(drag.x0, drag.x1) * specDuration, t1 = Math.max(drag.x0, drag.x1) * specDuration;
+  const f1 = (1 - Math.min(drag.y0, drag.y1)) * fMax, f0 = (1 - Math.max(drag.y0, drag.y1)) * fMax;
+  $("#dragLabel").textContent =
+    `框选 ${t0.toFixed(2)}–${t1.toFixed(2)} s · ${fmtHz(f0)}–${fmtHz(f1)}`;
+  draw();
+});
+window.addEventListener("mouseup", () => {
+  if (!dragging || !drag) return;
+  dragging = false;
+  const dx = Math.abs(drag.x1 - drag.x0), dy = Math.abs(drag.y1 - drag.y0);
+  if (dx > 0.002 && dy > 0.002) {
+    const t0 = Math.min(drag.x0, drag.x1) * specDuration, t1 = Math.max(drag.x0, drag.x1) * specDuration;
+    const f1 = (1 - Math.min(drag.y0, drag.y1)) * fMax, f0 = (1 - Math.max(drag.y0, drag.y1)) * fMax;
+    regions.push({ t0, t1, f0, f1 });
+    renderRegions();
+  }
+  drag = null;
+  draw();
+});
+
+/* ------------------------------------------------------------- region UI */
+
+function renderRegions() {
+  const box = $("#regionList");
+  if (!regions.length) {
+    box.innerHTML = `<span class="muted">尚未框选区域。</span>`;
+    $("#dragLabel").textContent = "在声谱图上拖拽可框选修复区域";
+    return;
+  }
+  box.innerHTML = regions.map((r, i) => `
+    <span class="file-card" style="display:inline-flex;align-items:center;gap:8px;padding:5px 10px;margin:0 8px 8px 0">
+      <span class="mono">${r.t0.toFixed(2)}–${r.t1.toFixed(2)}s · ${fmtHz(r.f0)}–${fmtHz(r.f1)}</span>
+      <button class="btn-sm btn-danger" data-del="${i}">✕</button>
+    </span>`).join("");
+}
+$("#regionList").addEventListener("click", e => {
+  if (e.target.dataset.del != null) {
+    regions.splice(+e.target.dataset.del, 1);
+    renderRegions();
+    draw();
+  }
+});
+$("#clearRegions").onclick = () => { regions = []; renderRegions(); draw(); };
+
+$("#gainDb").addEventListener("input", () => {
+  $("#gainDbVal").textContent = `${$("#gainDb").value} dB`;
+});
+$("#eraseChk").addEventListener("change", () => {
+  $("#gainDb").disabled = $("#eraseChk").checked;
+  $("#gainDbVal").textContent = $("#eraseChk").checked ? "-∞" : `${$("#gainDb").value} dB`;
+});
+
+function currentGainDb() {
+  return $("#eraseChk").checked ? -120 : +$("#gainDb").value;
+}
+
+function regionPayload() {
+  const g = currentGainDb();
+  return regions.map(r => ({ t0: r.t0, t1: r.t1, f0: r.f0, f1: r.f1, gain_db: g }));
+}
+
+/* ------------------------------------------------------------ repair ops */
+
+$("#previewBtn").onclick = async () => {
+  const id = $("#fileSel").value;
+  if (!id) return toast("请先选择文件", "warn");
+  if (!regions.length) return toast("请先在声谱图上框选区域", "warn");
+  const btn = $("#previewBtn"); btn.disabled = true;
+  try {
+    const r = await API.post("/api/repair/preview",
+      { file_id: id, regions: regionPayload(), gain_db: currentGainDb() });
+    toast("预览已渲染", "success");
+    playBase64Wav(r.wav);
+  } catch (e) { toast(e.message, "error"); }
+  finally { btn.disabled = false; }
+};
+
+$("#applyBtn").onclick = async () => {
+  const id = $("#fileSel").value;
+  if (!id) return toast("请先选择文件", "warn");
+  if (!regions.length) return toast("请先在声谱图上框选区域", "warn");
+  const btn = $("#applyBtn"); btn.disabled = true; btn.textContent = "处理中…";
+  try {
+    const entry = await API.post(`/api/audio/${id}/repair`, { regions: regionPayload() });
+    toast("修复完成，已生成新文件: " + entry.name, "success");
+    const rr = $("#repairResult");
+    rr.classList.remove("hidden");
+    rr.innerHTML = `
+      <button class="btn-green" id="openRepaired">▶ 查看修复结果</button>
+      <span class="muted">${esc(entry.name)} · ${fmtTime(entry.duration)}</span>`;
+    $("#openRepaired").onclick = () => { location.href = "/spectrogram?file=" + entry.id; };
+    await loadFiles(entry.id);
+  } catch (e) { toast(e.message, "error"); }
+  finally { btn.disabled = false; btn.textContent = "应用修复（生成新文件）"; }
+};
+
+/* ------------------------------------------------------- spectral features */
 
 function drawFeatures() {
   if (!spectral) return;
@@ -83,11 +292,17 @@ async function run() {
   const btn = $("#loadBtn");
   btn.disabled = true; btn.textContent = "分析中…";
   try {
-    const spec = (await API.get(`/api/analyze/${id}/spectrogram`)).data;
+    spec = (await API.get(`/api/analyze/${id}/spectrogram`)).data;
     spectral = (await API.get(`/api/analyze/${id}/spectral`)).data;
-    drawSpectrogram($("#spec"), spec);
+    specDuration = spec.duration ||
+      (spec.times.length ? spec.times[spec.times.length - 1] + (spec.times[1] - spec.times[0] || 0) : 0);
+    fMax = spec.sr / 2;
+    regions = [];
+    renderRegions();
+    renderSpec();
     $("#specInfo").textContent =
-      `${spec.times.length} 时间帧 × ${spec.freqs.length} 频带 · nfft=${spec.nfft} · hop=${spec.hop}`;
+      `${spec.times.length} 时间帧 × ${spec.freqs.length} 频带 · nfft=${spec.nfft} · hop=${spec.hop} · ${fmtTime(specDuration)}`;
+    $("#freqAxisLabel").textContent = `频率 0 – ${fmtHz(fMax)}（向上）`;
     drawFeatures();
   } catch (e) { toast(e.message, "error"); }
   finally { btn.disabled = false; btn.textContent = "分析"; }
@@ -97,6 +312,7 @@ $$("#features, #fCentroid, #fRolloff, #fFlat, #fFlux, #fRms, #fZcr").forEach(el 
   if (el.type === "checkbox") el.addEventListener("change", drawFeatures);
 });
 $("#loadBtn").onclick = run;
+window.addEventListener("resize", () => { if (spec) renderSpec(); });
 
 (async () => {
   await loadFiles(new URLSearchParams(location.search).get("file"));

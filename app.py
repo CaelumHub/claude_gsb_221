@@ -22,7 +22,7 @@ from typing import Dict, Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
+from backend import analysis, audio_io, chords, effects, mixer, realtime, repair, separation, storage
 
 try:
     from flask_cors import CORS
@@ -390,6 +390,77 @@ def api_edit(file_id: str):
     _apply_edit(_abs_path(entry), dst, op, data.get("params", {}))
     new_entry = _register_derived(entry["id"], name, dst, {"op": op})
     return jsonify(new_entry)
+
+
+# --------------------------------------------------------------------------- #
+# Spectral repair (频谱修复)
+# --------------------------------------------------------------------------- #
+
+def _parse_regions(data: Dict) -> Optional[list]:
+    """Validate the raw region list from a request body (None if invalid)."""
+    regions = data.get("regions")
+    if not isinstance(regions, list) or not regions:
+        return None
+    out = []
+    for r in regions[:repair.MAX_REGIONS]:
+        if not isinstance(r, dict):
+            return None
+        try:
+            vals = {
+                "t0": float(r.get("t0", 0.0)),
+                "t1": float(r.get("t1", 0.0)),
+                "f0": float(r.get("f0", 0.0)),
+                "f1": float(r.get("f1", 0.0)),
+                "gain_db": min(0.0, float(r.get("gain_db", -24.0))),
+            }
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(v) for v in vals.values()):
+            return None
+        out.append(vals)
+    return out
+
+
+@app.post("/api/audio/<file_id>/repair")
+def api_repair(file_id: str):
+    """Apply spectral repair: attenuate/erase the given time–frequency regions."""
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    data = request.get_json(force=True) or {}
+    regions = _parse_regions(data)
+    if regions is None:
+        return jsonify(error="regions must be a non-empty list of {t0,t1,f0,f1,gain_db}"), 400
+    name = data.get("name") or f"repair-{entry['name']}"
+
+    file_id_new = storage.new_id()
+    dst = os.path.join(store.audio_dir, file_id_new + ".wav")
+    try:
+        info = repair.spectral_repair(_abs_path(entry), dst, regions)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    new_entry = _register_derived(entry["id"], name, dst,
+                                  {"op": "spectral_repair", "regions": regions, **info})
+    return jsonify(new_entry)
+
+
+@app.post("/api/repair/preview")
+def api_repair_preview():
+    """Render a short repaired excerpt around the regions (base64 WAV)."""
+    data = request.get_json(force=True) or {}
+    file_id = data.get("file_id")
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    regions = _parse_regions(data)
+    if regions is None:
+        return jsonify(error="regions must be a non-empty list of {t0,t1,f0,f1,gain_db}"), 400
+    gain_db = min(0.0, float(data.get("gain_db", -24.0)))
+    try:
+        wav = repair.repair_preview(_abs_path(entry), regions, gain_db=gain_db)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify({"wav": base64.b64encode(wav).decode(), "size": len(wav)})
 
 
 # --------------------------------------------------------------------------- #

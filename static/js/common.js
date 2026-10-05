@@ -131,20 +131,19 @@ function drawWaveform(canvas, env, opts = {}) {
 function drawSpectrogram(canvas, spec, opts = {}) {
   const { ctx, w, h } = setupCanvas(canvas);
   const data = spec.data || [];
-  const rows = data.length;
+  const frames = data.length;            // time frames (x axis)
   ctx.clearRect(0, 0, w, h);
-  if (!rows) return;
+  if (!frames) return;
 
   const img = ctx.createImageData(w, h);
-  const cols = data[0].length;
+  const bands = data[0].length;          // frequency bands (y axis, low at bottom)
   // dB normalisation: assume floor -100, ceiling 0.
   const dbMin = opts.dbMin ?? -100, dbMax = opts.dbMax ?? 0;
   for (let y = 0; y < h; y++) {
-    const rowIdx = Math.floor((h - 1 - y) / h * rows);
-    const row = data[rowIdx];
+    const bandIdx = Math.min(bands - 1, Math.floor((h - 1 - y) / h * bands));
     for (let x = 0; x < w; x++) {
-      const colIdx = Math.floor(x / w * cols);
-      const v = row[colIdx];
+      const frameIdx = Math.min(frames - 1, Math.floor(x / w * frames));
+      const v = data[frameIdx][bandIdx];
       const t = (v - dbMin) / (dbMax - dbMin);
       const [r, g, b] = colormap(t);
       const idx = (y * w + x) * 4;
